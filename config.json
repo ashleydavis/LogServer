@@ -1,6 +1,0 @@
-{
-    "db": "logs",
-    "logsCollection": "logs",
-    "errorsCollection": "errors",
-    "port": 3000
-}

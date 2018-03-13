@@ -1,5 +1,21 @@
 'use strict';
 
+var argv = require('yargs').argv;
+var E = require('linq');
+var moment = require('moment');
+var express = require('express');
+var bodyParser = require('body-parser')
+var DailyReport = require('./daily-report');
+var assert = require('chai').assert;
+var cron = require('cron');
+var path = require('path');
+var conf = require('confucious');
+var fs = require('fs');
+
+process.on('uncaughtException', function (err) {
+    console.error('Uncaught Exception: ' + err.message + '\r\n' + err.stack);
+});
+
 //
 // Start the log server.
 //
@@ -9,27 +25,20 @@ var startServer = function (conf, outputPlugin) {
 		throw new Error("'outputPlugin' argument not specified.");
 	}
 
-	var argv = require('yargs').argv;
-	var E = require('linq');
-	var moment = require('moment');
+	assert.isObject(outputPlugin);
+	assert.isFunction(outputPlugin.emit);
+	assert.isFunction(outputPlugin.retrieveLogs);
 
-	var express = require('express');
 	var app = express();
-
-	var bodyParser = require('body-parser')
 	app.use(bodyParser.json()); 
 
-	app.get("/", function (req, res) {
-		res.send("Hello");
-	});
-    
 	//
 	// Check that the server is alive (used by the server monitor)
 	// 
-    app.get('/alive', function(req, res) {
-        res.status(200).end();
-    });
-
+    app.get("/alive", function (req, res) {
+        res.json({ ok: 1 });
+	});
+    
 	//
 	// Preprocess log to our expected structure.
 	//
@@ -69,50 +78,103 @@ var startServer = function (conf, outputPlugin) {
 		res.status(200).end();
 	});
 
-	var server = app.listen(conf.get("port"), "0.0.0.0", function () {
+    return new Promise(function (resolve, reject) {
+        var server = app.listen(conf.get("port"), "0.0.0.0", function (err) {
+            if (err) {
+                reject(err);
+                return;
+            }
 		var host = server.address().address;
 		var port = server.address().port;
 		console.log("Receiving logs at " + host + ":" + port + "/log");
-	});
+            resolve(server);
+        });
+    });
 };
 
 //
 // http://stackoverflow.com/a/6398335/25868
 // 
 if (require.main === module) { 
-	
-	console.log('Starting from command line.');
+    
+    console.log('Starting from command line.');
 
-	//
-	// Run from command line.
-	//
-	var conf = require('confucious');
-	var fs = require('fs');
-	if (fs.existsSync('config.json')) {
-		conf.pushJsonFile('config.json');		
-	}
-	conf.pushArgv();
-	if (!conf.get('db')) {
-		throw new Error("'db' not specified in config.json or as command line option.");
+    //
+    // Run from command line.
+    //
+	var configFilePath = path.join(__dirname, 'config.json');	
+    if (fs.existsSync(configFilePath)) {
+        conf.pushJsonFile(configFilePath);       
+    }
+	else {
+		console.log("!! " + configFilePath + " not found.");
 	}
 
-	if (!conf.get('logsCollection')) {
-		throw new Error("'logsCollection' not specified in config.json or as command line option.");
-	}
+    conf.pushArgv();
+    if (!conf.get('db')) {
+        throw new Error("'db' not specified in config.json or as command line option.");
+    }
 
-	if (!conf.get('errorsCollection')) {
-		throw new Error("'errorsCollection' not specified in config.json or as command line option.");
-	}
+    if (!conf.get('logsCollection')) {
+        throw new Error("'logsCollection' not specified in config.json or as command line option.");
+    }
 
-	if (!conf.get('port')) {
-		throw new Error("'port' not specified in config.json or as command line option.");
-	}
+    if (!conf.get('errorsCollection')) {
+        throw new Error("'errorsCollection' not specified in config.json or as command line option.");
+    }
 
-	startServer(conf, require('./mongodb-output')(conf));
+    if (!conf.get('port')) {
+        throw new Error("'port' not specified in config.json or as command line option.");
+    }
+
+	require('./mongodb-output')(conf)
+		.then(logStoragePlugin => {
+			return startServer(conf, logStoragePlugin)
+				.then(() => {
+					var emailDailyReport = function () {
+						console.log("Generating daily logging report email...");
+
+						var dailyReport = new DailyReport(logStoragePlugin, conf);
+						dailyReport.emailDailyReport(conf.get('mail:dailyReportSpec'))
+							.then(() => {
+								console.log("...generated daily logging report email.");
+							})
+							.catch(err => {
+								console.error("Failed to generate daily report\r\n" + err.stack);
+							})
+							;
+					};
+
+					if (argv.dailyReport) {
+						emailDailyReport();
+						return;
+					}	
+
+					console.log("Starting daily report cron...");
+
+					var dailyReportSchedule = conf.get('dailyReportSchedule');
+					assert.isString(dailyReportSchedule);
+
+					console.log('Daily report schduled: ' + dailyReportSchedule);
+					
+					var CronJob = cron.CronJob;
+					var cronJob = new CronJob({
+						cronTime: dailyReportSchedule,
+						onTick: emailDailyReport,
+						start: false,
+					});
+
+					cronJob.start();			
+				});
+		})
+        .catch(err => {
+            console.error("Failed to start server.\r\n" + err.stack);
+        })
+        ;
 }
 else {
-	// 
-	// Required from another module.
-	//
-	module.exports = startServer;
+    // 
+    // Required from another module.
+    //
+    module.exports = startServer;
 }
